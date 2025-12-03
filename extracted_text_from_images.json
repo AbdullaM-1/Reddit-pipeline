@@ -1,0 +1,564 @@
+{
+  "metadata": {
+    "total_posts": 11,
+    "total_images": 816,
+    "languages": [
+      "en"
+    ],
+    "extraction_date": "2025-11-21 15:41:46"
+  },
+  "statistics": {
+    "total_images": 816,
+    "processed": 6,
+    "successful": 6,
+    "failed": 0,
+    "total_text_extracted": 389,
+    "posts_processed": 11
+  },
+  "results": [
+    {
+      "post_id": "1p292oo",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2b8c0",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2eip9",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2ej41",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2elqa",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2gdmt",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2h4lg",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2ip6p",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2kl6o",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2p4nv",
+      "images": [],
+      "total_text": "",
+      "total_lines": 0,
+      "total_chars": 0
+    },
+    {
+      "post_id": "1p2pj2j",
+      "images": [
+        {
+          "filename": "e5008ba15203_1.png",
+          "file_path": "Downloaded_images\\1p2pj2j\\e5008ba15203_1.png",
+          "extraction": {
+            "success": true,
+            "text": "a1 3G\n\nHey, babe.\n\nHey! What's up? Just getting\nready for tonight—so excited\nto drink too much wine and\nget down with my hubby later.",
+            "text_lines": [
+              {
+                "text": "a1 3G",
+                "confidence": 0.44000000000000006,
+                "bbox": [
+                  [
+                    296,
+                    29
+                  ],
+                  [
+                    309,
+                    29
+                  ],
+                  [
+                    309,
+                    38
+                  ],
+                  [
+                    296,
+                    38
+                  ]
+                ]
+              },
+              {
+                "text": "Hey, babe.",
+                "confidence": 0.955,
+                "bbox": [
+                  [
+                    277,
+                    150
+                  ],
+                  [
+                    310,
+                    150
+                  ],
+                  [
+                    310,
+                    167
+                  ],
+                  [
+                    277,
+                    167
+                  ]
+                ]
+              },
+              {
+                "text": "Hey! What's up? Just getting",
+                "confidence": 0.96,
+                "bbox": [
+                  [
+                    43,
+                    201
+                  ],
+                  [
+                    77,
+                    201
+                  ],
+                  [
+                    77,
+                    218
+                  ],
+                  [
+                    43,
+                    218
+                  ]
+                ]
+              },
+              {
+                "text": "ready for tonight—so excited",
+                "confidence": 0.9325,
+                "bbox": [
+                  [
+                    42,
+                    224
+                  ],
+                  [
+                    85,
+                    224
+                  ],
+                  [
+                    85,
+                    241
+                  ],
+                  [
+                    42,
+                    241
+                  ]
+                ]
+              },
+              {
+                "text": "to drink too much wine and",
+                "confidence": 0.9216666666666665,
+                "bbox": [
+                  [
+                    41,
+                    248
+                  ],
+                  [
+                    56,
+                    248
+                  ],
+                  [
+                    56,
+                    260
+                  ],
+                  [
+                    41,
+                    260
+                  ]
+                ]
+              },
+              {
+                "text": "get down with my hubby later.",
+                "confidence": 0.9616666666666666,
+                "bbox": [
+                  [
+                    42,
+                    270
+                  ],
+                  [
+                    66,
+                    270
+                  ],
+                  [
+                    66,
+                    286
+                  ],
+                  [
+                    42,
+                    286
+                  ]
+                ]
+              }
+            ],
+            "line_count": 6,
+            "char_count": 133
+          }
+        },
+        {
+          "filename": "e7e42f7033fb.png",
+          "file_path": "Downloaded_images\\1p2pj2j\\e7e42f7033fb.png",
+          "extraction": {
+            "success": true,
+            "text": "oe\niv\n\nIt is NOT a date!\n\nLiam! | can't believe you are\nstill pushing buttons in your\nsituation!\n\nWell you just work on finishing\nthat dumb presentation so |\ncan see you before tomorrow.",
+            "text_lines": [
+              {
+                "text": "oe",
+                "confidence": 0.68,
+                "bbox": [
+                  [
+                    478,
+                    553
+                  ],
+                  [
+                    527,
+                    553
+                  ],
+                  [
+                    527,
+                    576
+                  ],
+                  [
+                    478,
+                    576
+                  ]
+                ]
+              },
+              {
+                "text": "It is NOT a date!",
+                "confidence": 0.866,
+                "bbox": [
+                  [
+                    160,
+                    747
+                  ],
+                  [
+                    189,
+                    747
+                  ],
+                  [
+                    189,
+                    796
+                  ],
+                  [
+                    160,
+                    796
+                  ]
+                ]
+              },
+              {
+                "text": "Liam! | can't believe you are",
+                "confidence": 0.9466666666666667,
+                "bbox": [
+                  [
+                    160,
+                    1470
+                  ],
+                  [
+                    310,
+                    1470
+                  ],
+                  [
+                    310,
+                    1520
+                  ],
+                  [
+                    160,
+                    1520
+                  ]
+                ]
+              },
+              {
+                "text": "still pushing buttons in your",
+                "confidence": 0.9279999999999999,
+                "bbox": [
+                  [
+                    157,
+                    1554
+                  ],
+                  [
+                    247,
+                    1554
+                  ],
+                  [
+                    247,
+                    1604
+                  ],
+                  [
+                    157,
+                    1604
+                  ]
+                ]
+              },
+              {
+                "text": "situation!",
+                "confidence": 0.96,
+                "bbox": [
+                  [
+                    157,
+                    1638
+                  ],
+                  [
+                    418,
+                    1638
+                  ],
+                  [
+                    418,
+                    1688
+                  ],
+                  [
+                    157,
+                    1688
+                  ]
+                ]
+              },
+              {
+                "text": "Well you just work on finishing",
+                "confidence": 0.96,
+                "bbox": [
+                  [
+                    157,
+                    2110
+                  ],
+                  [
+                    276,
+                    2110
+                  ],
+                  [
+                    276,
+                    2160
+                  ],
+                  [
+                    157,
+                    2160
+                  ]
+                ]
+              },
+              {
+                "text": "that dumb presentation so |",
+                "confidence": 0.96,
+                "bbox": [
+                  [
+                    156,
+                    2194
+                  ],
+                  [
+                    268,
+                    2194
+                  ],
+                  [
+                    268,
+                    2244
+                  ],
+                  [
+                    156,
+                    2244
+                  ]
+                ]
+              },
+              {
+                "text": "can see you before tomorrow.",
+                "confidence": 0.954,
+                "bbox": [
+                  [
+                    157,
+                    2291
+                  ],
+                  [
+                    258,
+                    2291
+                  ],
+                  [
+                    258,
+                    2328
+                  ],
+                  [
+                    157,
+                    2328
+                  ]
+                ]
+              }
+            ],
+            "line_count": 8,
+            "char_count": 186
+          }
+        },
+        {
+          "filename": "e7e42f7033fb_1.png",
+          "file_path": "Downloaded_images\\1p2pj2j\\e7e42f7033fb_1.png",
+          "extraction": {
+            "success": true,
+            "text": "g\n\nItis NOT a date!\n\n1 eet eer {h ef Rearaqrenn on",
+            "text_lines": [
+              {
+                "text": "g",
+                "confidence": 0.13,
+                "bbox": [
+                  [
+                    125,
+                    152
+                  ],
+                  [
+                    139,
+                    152
+                  ],
+                  [
+                    139,
+                    163
+                  ],
+                  [
+                    125,
+                    163
+                  ]
+                ]
+              },
+              {
+                "text": "Itis NOT a date!",
+                "confidence": 0.905,
+                "bbox": [
+                  [
+                    43,
+                    199
+                  ],
+                  [
+                    67,
+                    199
+                  ],
+                  [
+                    67,
+                    212
+                  ],
+                  [
+                    43,
+                    212
+                  ]
+                ]
+              },
+              {
+                "text": "1 eet ef on",
+                "confidence": 0.41500000000000004,
+                "bbox": [
+                  [
+                    43,
+                    392
+                  ],
+                  [
+                    44,
+                    392
+                  ],
+                  [
+                    44,
+                    400
+                  ],
+                  [
+                    43,
+                    400
+                  ]
+                ]
+              }
+            ],
+            "line_count": 3,
+            "char_count": 50
+          }
+        },
+        {
+          "filename": "ffeab5591aa8.png",
+          "file_path": "Downloaded_images\\1p2pj2j\\ffeab5591aa8.png",
+          "extraction": {
+            "success": true,
+            "text": "But too much, right?",
+            "text_lines": [
+              {
+                "text": "But too much, right?",
+                "confidence": 0.96,
+                "bbox": [
+                  [
+                    160,
+                    1951
+                  ],
+                  [
+                    253,
+                    1951
+                  ],
+                  [
+                    253,
+                    2001
+                  ],
+                  [
+                    160,
+                    2001
+                  ]
+                ]
+              }
+            ],
+            "line_count": 1,
+            "char_count": 20
+          }
+        },
+        {
+          "filename": "ffeab5591aa8_1.png",
+          "file_path": "Downloaded_images\\1p2pj2j\\ffeab5591aa8_1.png",
+          "extraction": {
+            "success": true,
+            "text": "",
+            "text_lines": [],
+            "line_count": 0,
+            "char_count": 0
+          }
+        },
+        {
+          "filename": "x84apcdjd4l.png",
+          "file_path": "Downloaded_images\\1p2pj2j\\x84apcdjd4l.png",
+          "extraction": {
+            "success": true,
+            "text": "",
+            "text_lines": [],
+            "line_count": 0,
+            "char_count": 0
+          }
+        }
+      ],
+      "total_text": "[e5008ba15203_1.png]\na1 3G\n\nHey, babe.\n\nHey! What's up? Just getting\nready for tonight—so excited\nto drink too much wine and\nget down with my hubby later.\n\n[e7e42f7033fb.png]\noe\niv\n\nIt is NOT a date!\n\nLiam! | can't believe you are\nstill pushing buttons in your\nsituation!\n\nWell you just work on finishing\nthat dumb presentation so |\ncan see you before tomorrow.\n\n[e7e42f7033fb_1.png]\ng\n\nItis NOT a date!\n\n1 eet eer {h ef Rearaqrenn on\n\n[ffeab5591aa8.png]\nBut too much, right?",
+      "total_lines": 18,
+      "total_chars": 389
+    }
+  ]
+}

@@ -3,9 +3,11 @@ bs4==0.0.2
 certifi==2024.12.14
 charset-normalizer==3.4.1
 colorama==0.4.6
+easyocr>=1.7.0
 html5lib==1.1
 idna==3.10
 numerize==0.12
+openai>=1.0.0
 python-dotenv==1.0.1
 requests==2.32.3
 six==1.17.0

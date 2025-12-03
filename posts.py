@@ -189,7 +189,7 @@ logging.basicConfig(
 # Load DOTENV
 config = dotenv_values(".env")
 
-# Credentials
+# Credentials (optional - can work without them using unauthenticated endpoints)
 client_id = config.get("client_id")
 client_secret = config.get("client_secret")
 username = config.get("username")
@@ -197,8 +197,9 @@ password = config.get("password")
 POSTS_PER_SUBREDDIT = config.get("POSTS_PER_SUBREDDIT")
 POSTS_SORT_FILTER = config.get("POSTS_SORT_FILTER")  # hot,new,top,rising,controversial
 
-if not client_id or not client_secret or not username or not password:
-    raise Exception("please give credentials in .env file")
+# Credentials are optional - if not provided, will use unauthenticated endpoints
+# if not client_id or not client_secret or not username or not password:
+#     raise Exception("please give credentials in .env file")
 
 if not POSTS_SORT_FILTER or not POSTS_PER_SUBREDDIT:
     raise Exception(
@@ -898,22 +899,27 @@ def run():
     }
     acc_token = getToken(params, 10)
 
+    if not acc_token:
+        print(f"{Fore.YELLOW}Warning: Running without authentication. Rate limits may apply.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}To use authenticated requests, add client_id and client_secret to .env file{Style.RESET_ALL}")
+        acc_token = ""  # Continue with empty token for unauthenticated requests
+
     # Get all awards
     awards: list[Awards] = fetchAwards()
-    with open("awards.json", "w") as fp:
+    with open("awards.json", "w", encoding="utf-8") as fp:
         json.dump(awards, fp)
 
     # Get all trophies
     trophies: list[Trophies] = fetchTrophies()
-    with open("trophies.json", "w") as fp:
+    with open("trophies.json", "w", encoding="utf-8") as fp:
         json.dump(trophies, fp)
 
     topic_data = {}
-    with open("./topics.json", "r") as fp:
+    with open("./topics.json", "r", encoding="utf-8") as fp:
         topic_data: dict[str, list[str]] = json.load(fp)
 
     subreddit_data: dict[str, list[Subreddit]] = {}
-    with open("./subreddits.json", "r") as fp:
+    with open("./subreddits.json", "r", encoding="utf-8") as fp:
         subreddit_data = json.load(fp)
 
     if subreddit_data:
@@ -926,7 +932,7 @@ def run():
         # on demand subreddits
         on_demand_subreddits: list[OnDemandSubreddit] = []
         try:
-            with open("./ondemand.json", "r") as fp:
+            with open("./ondemand.json", "r", encoding="utf-8") as fp:
                 on_demand_subreddits: list[OnDemandSubreddit] = json.load(fp)
         except Exception:
             print(traceback.print_exc())
@@ -1026,7 +1032,7 @@ def run():
                 )
 
         # Make posts
-        with open("posts.json", "w") as fp:
+        with open("posts.json", "w", encoding="utf-8") as fp:
             json.dump(posts, fp)
 
         seen_users: dict[str, User] = {}
@@ -1087,12 +1093,122 @@ def run():
                                 )
                             ]
         # Make subreddit members update
-        with open("subreddits.json", "w") as fp:
+        with open("subreddits.json", "w", encoding="utf-8") as fp:
             json.dump(subreddit_data, fp)
 
         # Make users
         tmp_users: list[User] = []
-        with open("users.json", "w") as fp:
+        with open("users.json", "w", encoding="utf-8") as fp:
             for user in seen_users.values():
                 tmp_users.append(user)
             json.dump(tmp_users, fp)
+
+
+def fetchSpecificPost(subreddit: str, post_id: str) -> Post | None:
+    """
+    Fetch details for a specific post by subreddit and post ID.
+    
+    Args:
+        subreddit: Subreddit name (e.g., "r/python" or "python")
+        post_id: Post ID from Reddit
+    
+    Returns:
+        Post object with all details or None if failed
+    """
+    # Get token (optional)
+    params = {
+        "grant_type": "password",
+        "username": username,
+        "password": password,
+    }
+    acc_token = getToken(params, 10)
+    
+    if not acc_token:
+        print(f"{Fore.YELLOW}Running without authentication. Rate limits may apply.{Style.RESET_ALL}")
+        acc_token = ""
+    
+    # Normalize subreddit name
+    if not subreddit.startswith("r/"):
+        subreddit = f"r/{subreddit}"
+    
+    # Fetch the post
+    print(f"{Fore.CYAN}Fetching post {post_id} from {subreddit}...{Style.RESET_ALL}")
+    raw_json_post = fetchPostArticleByPostID(subreddit, post_id, acc_token)
+    
+    if not raw_json_post.get("result_state", {}).get("success", False):
+        error = raw_json_post.get("result_state", {}).get("error", "Unknown error")
+        print(f"{Fore.RED}Failed to fetch post: {error}{Style.RESET_ALL}")
+        return None
+    
+    post_data = raw_json_post.get("post", [])
+    if not post_data or not isinstance(post_data, list) or len(post_data) < 1:
+        print(f"{Fore.RED}Invalid post data received{Style.RESET_ALL}")
+        return None
+    
+    # Extract post details
+    post_detail = post_data[0].get("data", {}).get("children", [])
+    if not post_detail or len(post_detail) == 0:
+        print(f"{Fore.RED}No post data found{Style.RESET_ALL}")
+        return None
+    
+    post_detail_data = post_detail[0].get("data", {})
+    
+    # Get awards (simplified - just empty list for now)
+    awards: list[Awards] = []
+    
+    # Build the post object
+    new_post: Post = {
+        "id": post_detail_data.get("id", ""),
+        "subreddit": post_detail_data.get("subreddit_name_prefixed", subreddit),
+        "subreddit_id": post_detail_data.get("subreddit_id", "").replace("t5_", ""),
+        "author": post_detail_data.get("author", ""),
+        "author_fullname": post_detail_data.get("author_fullname", "").replace("t2_", ""),
+        "title": post_detail_data.get("title", ""),
+        "ups": str(post_detail_data.get("ups", 0)),
+        "over_18": post_detail_data.get("over_18", False),
+        "spoiler": post_detail_data.get("spoiler", False),
+        "link_flair_text": post_detail_data.get("link_flair_text", ""),
+        "author_flair_text": post_detail_data.get("author_flair_text", ""),
+        "created_utc": post_detail_data.get("created_utc", 0),
+        "created_human": (
+            unix_epoch_to_human_readable(post_detail_data.get("created_utc", 0))
+            if post_detail_data.get("created_utc", 0)
+            else ""
+        ),
+        "num_comments": post_detail_data.get("num_comments", 0),
+        "awards": awards,
+        "text": post_detail_data.get("selftext", ""),
+        "text_html": (
+            post_detail_data.get("selftext_html", "")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            if post_detail_data.get("selftext_html", "")
+            else ""
+        ),
+        "comments": [],
+        "media_content": {},
+    }
+    
+    # Build media content
+    print(f"{Fore.CYAN}Building media content...{Style.RESET_ALL}")
+    new_post["media_content"] = buildMedia(post_detail_data)
+    
+    # Build comments
+    if len(post_data) > 1:
+        post_detail_comment = post_data[1].get("data", {}).get("children", [])
+        subreddit_users: dict[str, set[str]] = defaultdict(set[str])
+        subreddit_id = new_post["subreddit_id"]
+        subreddit_name = new_post["subreddit"]
+        
+        print(f"{Fore.CYAN}Building comments...{Style.RESET_ALL}")
+        comments, num_comments = buildComments(
+            post_detail_comment,
+            subreddit_users,
+            subreddit_id,
+            subreddit_name,
+        )
+        new_post["comments"] = comments
+        new_post["num_comments"] = num_comments
+    
+    print(f"{Fore.GREEN}Successfully fetched post: {new_post['title']}{Style.RESET_ALL}")
+    return new_post

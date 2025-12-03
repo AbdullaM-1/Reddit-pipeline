@@ -120,7 +120,7 @@ logging.basicConfig(
 # Load DOTENV
 config = dotenv_values(".env")
 
-# Credentials
+# Credentials (optional - can work without them using unauthenticated endpoints)
 client_id = config.get("client_id")
 client_secret = config.get("client_secret")
 username = config.get("username")
@@ -130,8 +130,9 @@ SUBREDDIT_SORT_FILTER = config.get(
     "SUBREDDIT_SORT_FILTER"
 )  # Sort by -> relevance, hot, top, new, comments
 
-if not client_id or not client_secret or not username or not password:
-    raise Exception("please give credentials in .env file")
+# Credentials are optional - if not provided, will use unauthenticated endpoints
+# if not client_id or not client_secret or not username or not password:
+#     raise Exception("please give credentials in .env file")
 
 if not SUBREDDIT_SORT_FILTER or not TOTAL_SUBREDDITS_PER_TOPICS:
     raise Exception(
@@ -245,8 +246,12 @@ def fetchSubredditModerators(subreddit: str, token: str) -> SubredditModeratorsR
     session = getSession()
 
     try:
+        if token:
+            url = f"https://oauth.reddit.com/r/{subreddit}/about/moderators.json"
+        else:
+            url = f"https://www.reddit.com/r/{subreddit}/about/moderators.json"
         response = session.get(
-            f"https://oauth.reddit.com/r/{subreddit}/about/moderators.json",
+            url,
             headers=getHeaders(getUserAgent(), token),
         )
         response.raise_for_status()
@@ -320,8 +325,12 @@ def fetchSubredditFlairsUser(subreddit: str, token: str) -> SubredditFlairsResul
     session = getSession()
 
     try:
+        if token:
+            url = f"https://oauth.reddit.com/r/{subreddit}/api/user_flair_v2"
+        else:
+            url = f"https://www.reddit.com/r/{subreddit}/api/user_flair_v2"
         response = session.get(
-            f"https://oauth.reddit.com/r/{subreddit}/api/user_flair_v2",
+            url,
             headers=getHeaders(getUserAgent(), token),
         )
         response.raise_for_status()
@@ -367,8 +376,12 @@ def fetchSubredditFlairs(subreddit: str, token: str) -> SubredditFlairsResult:
     session = getSession()
 
     try:
+        if token:
+            url = f"https://oauth.reddit.com/r/{subreddit}/api/link_flair_v2"
+        else:
+            url = f"https://www.reddit.com/r/{subreddit}/api/link_flair_v2"
         response = session.get(
-            f"https://oauth.reddit.com/r/{subreddit}/api/link_flair_v2",
+            url,
             headers=getHeaders(getUserAgent(), token),
         )
         response.raise_for_status()
@@ -474,7 +487,7 @@ def fetchSubredditsByName(subreddit: str, token: str) -> SubredditResult:
             )
         else:
             response = session.get(
-                f"https://oauth.reddit.com/{subreddit}/about.json",
+                f"https://www.reddit.com/{subreddit}/about.json",
                 headers=getHeaders(getUserAgent(), token),
             )
         response.raise_for_status()
@@ -751,12 +764,14 @@ def run():
     acc_token = getToken(params, 10)
 
     if not acc_token:
-        sys.exit(1)
+        print(f"{Fore.YELLOW}Warning: Running without authentication. Rate limits may apply.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}To use authenticated requests, add client_id and client_secret to .env file{Style.RESET_ALL}")
+        acc_token = ""  # Continue with empty token for unauthenticated requests
 
     # on demand subreddits
     on_demand_subreddits: list[OnDemandSubreddit] = []
     try:
-        with open("./ondemand.json", "r") as fp:
+        with open("./ondemand.json", "r", encoding="utf-8") as fp:
             on_demand_subreddits: list[OnDemandSubreddit] = json.load(fp)
     except Exception:
         print(traceback.print_exc())
@@ -764,7 +779,7 @@ def run():
 
     # Get all topics
     TOPICS = {}
-    with open("./topics.json", "r") as fp:
+    with open("./topics.json", "r", encoding="utf-8") as fp:
         data: dict[str, list[str]] = json.load(fp)
         final: list[str] = []
 
@@ -900,6 +915,6 @@ def run():
                 print(traceback.print_exc())
                 sys.exit(1)
 
-    with open("subreddits.json", "w") as fp:
+    with open("subreddits.json", "w", encoding="utf-8") as fp:
         sorted_subreddits = dict(sorted(subreddits.items()))
         json.dump(sorted_subreddits, fp)
