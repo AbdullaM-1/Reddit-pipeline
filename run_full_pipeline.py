@@ -1108,24 +1108,59 @@ def step_ocr_streamed(local_images: List[Dict], reader: Any | None, ocr_workers:
     return summary
 
 
+def cleanup_images(local_images: List[Dict[str, Any]], post_id: str) -> None:
+    """
+    Delete downloaded images after processing is complete.
+    
+    Args:
+        local_images: List of image dictionaries with 'local_path' key
+        post_id: Post ID for logging purposes
+    """
+    deleted_count = 0
+    failed_count = 0
+    
+    for img in local_images:
+        image_path = img.get("local_path")
+        if not image_path:
+            continue
+            
+        try:
+            path = Path(image_path)
+            if path.exists() and path.is_file():
+                path.unlink()  # Delete the file
+                deleted_count += 1
+        except Exception as e:
+            failed_count += 1
+            print(f"{Fore.YELLOW}Warning: Failed to delete image {image_path}: {e}{Style.RESET_ALL}")
+    
+    # Try to delete the post directory if it's empty
+    try:
+        post_dir = IMAGES_DIR / sanitize_filename(post_id)
+        if post_dir.exists() and post_dir.is_dir():
+            # Check if directory is empty
+            try:
+                post_dir.rmdir()  # Will only work if directory is empty
+                print(f"{Fore.CYAN}[CLEANUP] Deleted empty directory: {post_dir}{Style.RESET_ALL}")
+            except OSError:
+                # Directory not empty, that's okay - just leave it
+                pass
+    except Exception as e:
+        # Ignore directory deletion errors
+        pass
+    
+    if deleted_count > 0:
+        print(f"{Fore.GREEN}[CLEANUP] Deleted {deleted_count} images for post {post_id}{Style.RESET_ALL}")
+    if failed_count > 0:
+        print(f"{Fore.YELLOW}[CLEANUP] Failed to delete {failed_count} images for post {post_id}{Style.RESET_ALL}")
+
+
 def process_post(post: RedditPost, reader: Any | None, ocr_workers: int, existing_post_ids: set[str] | None = None) -> Dict[str, Any]:
     post_id = str(post.get("id") or post.get("name") or "unknown_post")
     title = post.get("title", "")
     print(f"\n{Fore.MAGENTA}===== Processing post {post_id}: {title[:60]} ====={Style.RESET_ALL}")
 
-    # Double-check against existing IDs if provided (from Supabase/local DB)
-    if existing_post_ids and post_id in existing_post_ids:
-        print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {title[:60]} - already exists in database, skipping.{Style.RESET_ALL}")
-        return {
-            "post_id": post_id,
-            "title": title,
-            "status": "skipped_existing"
-        }
-    
-    existing = get_existing_result(post_id)
-    if existing:
-        print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {title[:60]} - already exists in local pipeline_results, skipping.{Style.RESET_ALL}")
-        return existing
+    # Note: We already filtered this post before calling process_post(), so it's guaranteed to be new
+    # Skip redundant checks and proceed directly to processing
     
     print(f"{Fore.CYAN}[PROCESSING] Post {post_id}: {title[:60]} - starting processing...{Style.RESET_ALL}")
 
@@ -1150,6 +1185,11 @@ def process_post(post: RedditPost, reader: Any | None, ocr_workers: int, existin
             post_date=None,
             post_data=post
         )
+        
+        # Mark as processed
+        if existing_post_ids is not None:
+            existing_post_ids.add(post_id)
+        
         return result
 
     print(f"{Fore.CYAN}[LINK FOUND] Post {post_id}: {title[:60]} - correct link: {link[:50]}...{Style.RESET_ALL}")
@@ -1171,6 +1211,11 @@ def process_post(post: RedditPost, reader: Any | None, ocr_workers: int, existin
             post_date=None,
             post_data=post
         )
+        
+        # Mark as processed
+        if existing_post_ids is not None:
+            existing_post_ids.add(post_id)
+        
         return result
 
     print(f"{Fore.CYAN}[DOWNLOADED] Post {post_id}: {title[:60]} - downloaded {len(image_result.get('local_images', []))} images, starting OCR...{Style.RESET_ALL}")
@@ -1190,7 +1235,14 @@ def process_post(post: RedditPost, reader: Any | None, ocr_workers: int, existin
         post_data=post
     )
     
+    # Delete images after processing is complete (OCR done, data saved)
+    cleanup_images(image_result["local_images"], post_id)
+    
     print(f"{Fore.GREEN}[COMPLETE] Post {post_id}: {title[:60]} - processing complete (status: success){Style.RESET_ALL}")
+    
+    # Mark as processed in existing_post_ids set to avoid duplicate processing in same run
+    if existing_post_ids is not None:
+        existing_post_ids.add(post_id)
     
     return result
 
@@ -1418,8 +1470,8 @@ def main():
                     print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {post_title} - already exists in Supabase{Style.RESET_ALL}")
             else:
                 new_posts_in_batch.append(post)
-                # Add to existing set to avoid duplicates within this run
-                existing_post_ids.add(post_id)
+                # Don't add to existing_post_ids here - these posts will be processed and saved
+                # We'll add them after successful processing to avoid duplicates within this run
                 print(f"{Fore.GREEN}[NEW] Post {post_id}: {post_title} - will be processed{Style.RESET_ALL}")
         
         print(f"{Fore.CYAN}Batch {batch_number} filtered: {len(new_posts_in_batch)} new posts, {skipped_in_batch} skipped{Style.RESET_ALL}")
