@@ -1,17 +1,31 @@
 #!/usr/bin/env python
 """
-Single-run pipeline that:
-1. Streams every available post from a subreddit (paged via listing + detail calls)
-2. For each post, identifies the correct outbound link from the author's comment
-3. Downloads every image found at that link
-4. Runs OCR on the downloaded images
-5. Stores a per-post result JSON under pipeline_results/<post_id>.json
+Incremental Pipeline Updater - Processes only new posts
+
+This pipeline is designed for regular updates:
+1. Fetches the last N posts from a subreddit (sorted by "new" by default)
+2. Checks each post against the existing database (pipeline_results.json)
+3. Skips posts that already exist
+4. For new posts only:
+   - Identifies the correct outbound link from the author's comment
+   - Downloads every image found at that link
+   - Runs OCR on the downloaded images
+   - Stores result in pipeline_results/pipeline_results.json
 
 This script stitches together the previously built modules:
     posts.py                        -> low-level Reddit fetching helpers
     identify_correct_links.py       -> link selection logic
     extract_images_from_links.py    -> HTML/image scraping + download
     extract_text_from_images.py     -> EasyOCR / pytesseract text extraction
+
+Usage:
+    python run_full_pipeline.py --subreddit SextStories --max-posts 100
+
+The script will automatically:
+- Load existing post IDs from pipeline_results.json and posts.json
+- Fetch recent posts from Reddit
+- Process only posts that don't exist in the database
+- Skip posts that have already been processed
 """
 
 from __future__ import annotations
@@ -22,6 +36,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, TextIO, cast
 from requests.exceptions import HTTPError
@@ -100,9 +115,10 @@ except Exception:
 # CONFIGURATION
 # ============================================
 DEFAULT_SUBREDDIT = "SextStories"
-SORT_FILTER = "new"  # hot/new/top/rising/controversial
-FETCH_ALL = True
-MAX_POSTS = None  # None means "as many as Reddit exposes (~1000 per sort)"; set int to cap
+SORT_FILTER = "new"  # hot/new/top/rising/controversial - always use "new" for incremental updates
+FETCH_ALL = False  # Changed to False - only fetch recent posts
+MAX_POSTS = 100  # Fetch last 100 posts from "new" sort (adjust as needed)
+RECENT_POSTS_LIMIT = 100  # Number of recent posts to check for updates
 POSTS_PER_REQUEST_AUTH = 100
 POSTS_PER_REQUEST_ANON = 25
 MAX_LISTING_RETRIES = 5
@@ -142,6 +158,143 @@ def init_aggregate_storage(output_file: Optional[Path] = None) -> None:
                 f"{Fore.YELLOW}Aggregated pipeline results corrupted; starting fresh.{Style.RESET_ALL}"
             )
     record_restart_chunk(len(AGGREGATE_DATA.get("order", [])))
+
+
+def check_post_exists_in_supabase(post_id: str) -> bool:
+    """
+    Check if a single post exists in Supabase database.
+    Uses efficient hash-based lookup instead of loading all IDs.
+    
+    Args:
+        post_id: Reddit post ID to check
+    
+    Returns:
+        True if post exists, False otherwise
+    """
+    try:
+        from supabase_client import post_exists, get_supabase_client
+        supabase_client = get_supabase_client()
+        if supabase_client:
+            return post_exists(post_id, supabase_client)
+        return False
+    except ImportError:
+        return False
+    except Exception as e:
+        print(f"{Fore.YELLOW}Error checking post in Supabase: {e}{Style.RESET_ALL}")
+        return False
+
+
+def save_post_to_supabase(
+    post_id: str,
+    title: str,
+    correct_link: str | None,
+    post_date: datetime | None,
+    post_data: RedditPost | None = None
+) -> bool:
+    """
+    Save processed post to Supabase database after successful processing.
+    
+    Args:
+        post_id: Reddit post ID
+        title: Post title
+        correct_link: Identified correct link from author's comment
+        post_date: Date of the post (datetime object)
+        post_data: Optional Reddit post data to extract date from if post_date is None
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from supabase_client import upsert_post, get_supabase_client
+        
+        supabase_client = get_supabase_client()
+        if not supabase_client:
+            print(f"{Fore.YELLOW}Supabase client not available, skipping database save{Style.RESET_ALL}")
+            return False
+        
+        # Extract post date if not provided
+        if post_date is None and post_data:
+            created_utc = post_data.get("created_utc")
+            if created_utc:
+                try:
+                    if isinstance(created_utc, (int, float)):
+                        post_date = datetime.fromtimestamp(created_utc)
+                    elif isinstance(created_utc, str) and created_utc.isdigit():
+                        post_date = datetime.fromtimestamp(int(created_utc))
+                except (ValueError, OSError):
+                    pass
+        
+        # Use current time as fallback if date still not available
+        if post_date is None:
+            post_date = datetime.now()
+            print(f"{Fore.YELLOW}Warning: Could not extract post date, using current time{Style.RESET_ALL}")
+        
+        # Save to Supabase
+        result_id = upsert_post(
+            post_id=post_id,
+            title=title,
+            correct_link=correct_link,
+            post_date=post_date,
+            client=supabase_client
+        )
+        
+        if result_id:
+            print(f"{Fore.GREEN}[SUPABASE] Saved post {post_id} to database{Style.RESET_ALL}")
+            return True
+        else:
+            print(f"{Fore.YELLOW}[SUPABASE] Failed to save post {post_id} to database{Style.RESET_ALL}")
+            return False
+            
+    except ImportError:
+        print(f"{Fore.YELLOW}supabase_client not available, skipping database save{Style.RESET_ALL}")
+        return False
+    except Exception as e:
+        print(f"{Fore.YELLOW}Error saving post to Supabase: {e}{Style.RESET_ALL}")
+        return False
+
+
+def load_all_existing_post_ids() -> set[str]:
+    """
+    Load existing post IDs from local files only (pipeline_results.json, posts.json).
+    
+    NOTE: We do NOT load all IDs from Supabase here - that would be inefficient.
+    Instead, we check Supabase individually for each post using check_post_exists_in_supabase()
+    which uses the hash index for fast O(1) lookups.
+    
+    Returns a set of post IDs from local files only.
+    """
+    existing_ids: set[str] = set()
+    
+    # Load from pipeline_results/pipeline_results.json if it exists
+    try:
+        if AGGREGATE_OUTPUT_FILE.exists():
+            with open(AGGREGATE_OUTPUT_FILE, "r", encoding="utf-8") as fp:
+                pipeline_data = json.load(fp)
+                posts_dict = pipeline_data.get("posts", {})
+                for post_id in posts_dict.keys():
+                    existing_ids.add(post_id)
+            print(f"{Fore.CYAN}Loaded {len(existing_ids)} existing post IDs from pipeline_results.json{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"{Fore.YELLOW}Error loading pipeline_results.json: {e}{Style.RESET_ALL}")
+    
+    # Also load from posts.json if it exists (from the main run.py pipeline)
+    try:
+        posts_json_path = Path("posts.json")
+        if posts_json_path.exists():
+            posts_from_file = 0
+            with open(posts_json_path, "r", encoding="utf-8") as fp:
+                posts_list = json.load(fp)
+                for post in posts_list:
+                    post_id = post.get("id", "")
+                    if post_id:
+                        existing_ids.add(post_id)
+                        posts_from_file += 1
+            if posts_from_file > 0:
+                print(f"{Fore.CYAN}Also loaded {posts_from_file} post IDs from posts.json{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"{Fore.YELLOW}Error loading posts.json: {e}{Style.RESET_ALL}")
+    
+    return existing_ids
 
 
 def get_existing_result(post_id: str) -> Optional[Dict[str, Any]]:
@@ -521,20 +674,16 @@ def stream_full_post_batches(
     )
 
     fetched = 0
-    state = load_pagination_state(subreddit, sort_filter)
-    saved_after = state.get("after")
+    # Always start fresh to get the newest posts (ignore saved pagination state)
+    after = None
     if resume_after:
         after = normalize_fullname(resume_after)
         print(
             f"{Fore.YELLOW}Resuming listing from user-specified cursor {after}{Style.RESET_ALL}"
         )
     else:
-        after = saved_after
-        if after:
-            print(f"{Fore.YELLOW}Resuming listing from stored cursor {after}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Starting fresh from {subreddit} ({sort_filter}) - fetching newest posts{Style.RESET_ALL}")
     batch = 0
-    if after:
-        print(f"{Fore.YELLOW}Resuming listing from stored cursor {after}{Style.RESET_ALL}")
 
     print(f"{Fore.CYAN}Starting stream from {subreddit} ({sort_filter}){Style.RESET_ALL}")
     if fetch_all:
@@ -563,9 +712,14 @@ def stream_full_post_batches(
         )
         headers = getHeaders(getUserAgent(), token)
 
-        print(
-            f"{Fore.CYAN}Fetching batch {batch} (limit={current_limit}, after={after})...{Style.RESET_ALL}"
-        )
+        if after:
+            print(
+                f"{Fore.CYAN}Fetching batch {batch} (limit={current_limit}, after={after})...{Style.RESET_ALL}"
+            )
+        else:
+            print(
+                f"{Fore.CYAN}Fetching batch {batch} (limit={current_limit}) - starting from newest posts...{Style.RESET_ALL}"
+            )
         listing = fetch_listing(session, url, headers, params)
         if not listing or "data" not in listing:
             print(f"{Fore.YELLOW}No listing data returned; stopping.{Style.RESET_ALL}")
@@ -618,7 +772,7 @@ def stream_full_post_batches(
             yield batch_posts
 
         last_fullname = (
-            batch_posts[-1].get("name") if batch_posts else state.get("last_post_fullname")
+            batch_posts[-1].get("name") if batch_posts else None
         )
         save_pagination_state(
             subreddit=subreddit,
@@ -954,15 +1108,26 @@ def step_ocr_streamed(local_images: List[Dict], reader: Any | None, ocr_workers:
     return summary
 
 
-def process_post(post: RedditPost, reader: Any | None, ocr_workers: int) -> Dict[str, Any]:
+def process_post(post: RedditPost, reader: Any | None, ocr_workers: int, existing_post_ids: set[str] | None = None) -> Dict[str, Any]:
     post_id = str(post.get("id") or post.get("name") or "unknown_post")
     title = post.get("title", "")
     print(f"\n{Fore.MAGENTA}===== Processing post {post_id}: {title[:60]} ====={Style.RESET_ALL}")
 
+    # Double-check against existing IDs if provided (from Supabase/local DB)
+    if existing_post_ids and post_id in existing_post_ids:
+        print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {title[:60]} - already exists in database, skipping.{Style.RESET_ALL}")
+        return {
+            "post_id": post_id,
+            "title": title,
+            "status": "skipped_existing"
+        }
+    
     existing = get_existing_result(post_id)
     if existing:
-        print(f"{Fore.YELLOW}Result already exists for {post_id}, skipping.{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {title[:60]} - already exists in local pipeline_results, skipping.{Style.RESET_ALL}")
         return existing
+    
+    print(f"{Fore.CYAN}[PROCESSING] Post {post_id}: {title[:60]} - starting processing...{Style.RESET_ALL}")
 
     result: Dict[str, Any] = {
         "post_id": post_id,
@@ -974,8 +1139,20 @@ def process_post(post: RedditPost, reader: Any | None, ocr_workers: int) -> Dict
     if not link:
         result["status"] = "no_link"
         persist_result(result)
+        
+        print(f"{Fore.YELLOW}[NO LINK] Post {post_id}: {title[:60]} - no correct link found{Style.RESET_ALL}")
+        
+        # Save to Supabase even if no link found (still record the post)
+        save_post_to_supabase(
+            post_id=post_id,
+            title=title,
+            correct_link=None,
+            post_date=None,
+            post_data=post
+        )
         return result
 
+    print(f"{Fore.CYAN}[LINK FOUND] Post {post_id}: {title[:60]} - correct link: {link[:50]}...{Style.RESET_ALL}")
     result["correct_link"] = link
     image_result = step_download_images(post_id, link)
     result["images"] = image_result
@@ -983,18 +1160,43 @@ def process_post(post: RedditPost, reader: Any | None, ocr_workers: int) -> Dict
     if not image_result["local_images"]:
         result["status"] = "no_images"
         persist_result(result)
+        
+        print(f"{Fore.YELLOW}[NO IMAGES] Post {post_id}: {title[:60]} - no images found at link{Style.RESET_ALL}")
+        
+        # Save to Supabase even if no images found (still record the post with link)
+        save_post_to_supabase(
+            post_id=post_id,
+            title=title,
+            correct_link=link,
+            post_date=None,
+            post_data=post
+        )
         return result
 
+    print(f"{Fore.CYAN}[DOWNLOADED] Post {post_id}: {title[:60]} - downloaded {len(image_result.get('local_images', []))} images, starting OCR...{Style.RESET_ALL}")
     ocr_result = step_ocr_streamed(image_result["local_images"], reader, ocr_workers)
     result["ocr"] = ocr_result
     result["status"] = "success"
 
     persist_result(result)
+    
+    # Save to Supabase database after successful processing
+    correct_link = result.get("correct_link")
+    save_success = save_post_to_supabase(
+        post_id=post_id,
+        title=title,
+        correct_link=correct_link,
+        post_date=None,  # Will be extracted from post_data
+        post_data=post
+    )
+    
+    print(f"{Fore.GREEN}[COMPLETE] Post {post_id}: {title[:60]} - processing complete (status: success){Style.RESET_ALL}")
+    
     return result
 
 
 def process_batch_concurrently(
-    posts: List[RedditPost], reader: Any | None, worker_count: int, ocr_workers: int
+    posts: List[RedditPost], reader: Any | None, worker_count: int, ocr_workers: int, existing_post_ids: set[str] | None = None
 ) -> None:
     if not posts:
         return
@@ -1006,7 +1208,7 @@ def process_batch_concurrently(
     failures = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_to_post = {
-            executor.submit(process_post, post, reader, ocr_workers): post for post in posts
+            executor.submit(process_post, post, reader, ocr_workers, existing_post_ids): post for post in posts
         }
         for future in as_completed(future_to_post):
             post = future_to_post[future]
@@ -1031,21 +1233,21 @@ def process_batch_concurrently(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run full Reddit -> link -> images -> OCR pipeline."
+        description="Incremental pipeline updater: fetches recent posts and processes only new ones that don't exist in database."
     )
     parser.add_argument("--subreddit", default=DEFAULT_SUBREDDIT)
     parser.add_argument("--sort", default=SORT_FILTER)
     parser.add_argument(
         "--max-posts",
         type=int,
-        default=MAX_POSTS if MAX_POSTS is not None else 0,
-        help="Cap number of posts to process (0=unlimited).",
+        default=MAX_POSTS if MAX_POSTS is not None else RECENT_POSTS_LIMIT,
+        help=f"Number of recent posts to fetch and check for updates (default: {RECENT_POSTS_LIMIT}).",
     )
     parser.add_argument(
         "--fetch-all",
         action="store_true",
         default=FETCH_ALL,
-        help="Keep paging until Reddit stops returning listings.",
+        help="Keep paging until Reddit stops returning listings (not recommended for update mode).",
     )
     parser.add_argument(
         "--workers",
@@ -1109,6 +1311,7 @@ def main():
 
     reader = init_ocr_reader()
     processed = 0
+    skipped = 0
 
     workers = max(1, args.workers)
     ocr_workers = max(1, args.ocr_workers)
@@ -1128,9 +1331,27 @@ def main():
         )
         return
 
+    # Initialize aggregate storage
     init_aggregate_storage()
+    
+    # Load existing post IDs from local files (for faster initial check)
+    # Supabase will be checked individually per post (more efficient)
+    existing_post_ids = load_all_existing_post_ids()
+    
+    print(f"{Fore.CYAN}Starting pipeline update mode: fetching recent posts and processing only new ones{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Found {len(existing_post_ids)} existing posts in local files{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Will check Supabase for each post individually (using hash index for fast lookup){Style.RESET_ALL}")
 
-    stream_args = (
+    # Set default max_posts if not specified (for update mode)
+    if max_posts is None:
+        max_posts = RECENT_POSTS_LIMIT
+        print(f"{Fore.CYAN}Fetching last {max_posts} posts from '{args.sort}' sort to check for updates{Style.RESET_ALL}")
+
+    # Stream posts and process incrementally (fetch batch -> filter -> process -> fetch next batch)
+    print(f"{Fore.CYAN}Starting incremental processing from {args.subreddit}...{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Will process posts as they are fetched (batch by batch){Style.RESET_ALL}")
+    
+    stream_gen = (
             stream_search_query_batches(
                 subreddit=args.subreddit,
                 sort_filter=args.sort,
@@ -1151,15 +1372,87 @@ def main():
                 resume_after=args.resume_after or None,
             )
         )
-
-    for batch in stream_args:
-        process_batch_concurrently(batch, reader, workers, ocr_workers)
-        processed += len(batch)
-        if max_posts and processed >= max_posts:
+    
+    total_fetched = 0
+    batch_number = 0
+    
+    # Process batches incrementally: fetch -> filter -> process -> repeat
+    for batch in stream_gen:
+        batch_number += 1
+        if not batch:
+            print(f"{Fore.YELLOW}No more posts available, stopping.{Style.RESET_ALL}")
             break
+        
+        print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Batch {batch_number}: Fetched {len(batch)} posts{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+        
+        total_fetched += len(batch)
+        
+        # Filter this batch: check which posts already exist
+        new_posts_in_batch: List[RedditPost] = []
+        skipped_in_batch = 0
+        
+        print(f"{Fore.CYAN}Checking batch {batch_number} against existing database...{Style.RESET_ALL}")
+        
+        for post in batch:
+            post_id = str(post.get("id") or post.get("name") or "")
+            post_title = post.get("title", "No title")[:60]  # Get title for logging
+            if not post_id:
+                continue
+                
+            # First check local files (fast, already loaded)
+            if post_id in existing_post_ids:
+                skipped_in_batch += 1
+                skipped += 1
+                if skipped_in_batch <= 3 or skipped_in_batch % 50 == 0:
+                    print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {post_title} - already exists in local files{Style.RESET_ALL}")
+                continue
+            
+            # Check Supabase database for this specific post (efficient per-post check)
+            if check_post_exists_in_supabase(post_id):
+                skipped_in_batch += 1
+                skipped += 1
+                existing_post_ids.add(post_id)  # Cache it to avoid re-checking
+                if skipped_in_batch <= 3 or skipped_in_batch % 50 == 0:
+                    print(f"{Fore.YELLOW}[SKIP] Post {post_id}: {post_title} - already exists in Supabase{Style.RESET_ALL}")
+            else:
+                new_posts_in_batch.append(post)
+                # Add to existing set to avoid duplicates within this run
+                existing_post_ids.add(post_id)
+                print(f"{Fore.GREEN}[NEW] Post {post_id}: {post_title} - will be processed{Style.RESET_ALL}")
+        
+        print(f"{Fore.CYAN}Batch {batch_number} filtered: {len(new_posts_in_batch)} new posts, {skipped_in_batch} skipped{Style.RESET_ALL}")
+        
+        # Process new posts from this batch immediately
+        if new_posts_in_batch:
+            print(f"{Fore.GREEN}Processing {len(new_posts_in_batch)} new posts from batch {batch_number}...{Style.RESET_ALL}")
+            process_batch_concurrently(
+                new_posts_in_batch, 
+                reader, 
+                workers, 
+                ocr_workers, 
+                existing_post_ids
+            )
+            processed += len(new_posts_in_batch)
+            print(f"{Fore.GREEN}Completed batch {batch_number}: {len(new_posts_in_batch)} posts processed{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}No new posts to process in batch {batch_number} (all already exist){Style.RESET_ALL}")
+        
+        # Check if we've reached the max_posts limit
+        if max_posts and total_fetched >= max_posts:
+            print(f"{Fore.CYAN}Reached max_posts limit ({max_posts}), stopping fetch.{Style.RESET_ALL}")
+            break
+        
+        # Also check if we've processed enough new posts
+        if max_posts and processed >= max_posts:
+            print(f"{Fore.CYAN}Processed {processed} new posts, stopping.{Style.RESET_ALL}")
+            break
+    
+    print(f"\n{Fore.GREEN}Total fetched: {total_fetched} posts from Reddit{Style.RESET_ALL}")
 
     print(
-        f"\n{Fore.CYAN}Pipeline complete. Processed {processed} posts from {args.subreddit}.{Style.RESET_ALL}"
+        f"\n{Fore.CYAN}Pipeline update complete. Processed {processed} new posts, skipped {skipped} existing posts from {args.subreddit}.{Style.RESET_ALL}"
     )
 
 
