@@ -1951,6 +1951,74 @@ def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "", cleanup
         return False
 
 
+def sync_knowledge_base(kb_id: str, datasource_id: str) -> bool:
+    """
+    Start a sync job for Amazon Bedrock Knowledge Base to ingest data from S3.
+    
+    Args:
+        kb_id: Knowledge Base ID
+        datasource_id: Data Source ID
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not BOTO3_AVAILABLE:
+        print(f"{Fore.YELLOW}Bedrock sync skipped: boto3 not available{Style.RESET_ALL}")
+        return False
+    
+    # Load AWS credentials from environment
+    config = dotenv_values(".env")
+    aws_access_key_id = config.get("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = config.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_region = config.get("AWS_REGION") or os.getenv("AWS_REGION", "us-east-1")
+    
+    if not aws_access_key_id or not aws_secret_access_key:
+        print(f"{Fore.YELLOW}Bedrock sync skipped: AWS credentials not found in environment{Style.RESET_ALL}")
+        return False
+    
+    if not kb_id or not datasource_id:
+        print(f"{Fore.YELLOW}Bedrock sync skipped: KB_ID or DATASOURCE_ID not provided{Style.RESET_ALL}")
+        return False
+    
+    try:
+        # Initialize Bedrock Agent client
+        if boto3 is None:  # type: ignore
+            return False
+        
+        bedrock_client = boto3.client(  # type: ignore
+            'bedrock-agent',
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=aws_region
+        )
+        
+        print(f"\n{Fore.CYAN}Starting Bedrock Knowledge Base sync...{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  Knowledge Base ID: {kb_id}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  Data Source ID: {datasource_id}{Style.RESET_ALL}")
+        
+        # Start ingestion job
+        response = bedrock_client.start_ingestion_job(
+            knowledgeBaseId=kb_id,
+            dataSourceId=datasource_id
+        )
+        
+        ingestion_job = response.get('ingestionJob', {})
+        ingestion_job_id = ingestion_job.get('ingestionJobId', 'Unknown')
+        ingestion_job_status = ingestion_job.get('status', 'Unknown')
+        
+        print(f"\n{Fore.GREEN}✓ Bedrock Knowledge Base sync started!{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}  Ingestion Job ID: {ingestion_job_id}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}  Status: {ingestion_job_status}{Style.RESET_ALL}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"{Fore.RED}Error starting Bedrock Knowledge Base sync: {str(e)}{Style.RESET_ALL}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None:
     """
     Run cleaning and flattening steps on pipeline results.
@@ -2117,10 +2185,27 @@ def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None
                 upload_success = upload_to_s3(split_output_dir, s3_bucket, s3_prefix, cleanup_after=cleanup_after_upload)
                 if upload_success:
                     print(f"\n{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
-                    print(f"{Fore.GREEN}✓✓✓ PIPELINE COMPLETE ✓✓✓{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}✓ Files uploaded to S3 bucket: {s3_bucket}{Style.RESET_ALL}")
                     if cleanup_after_upload:
                         print(f"{Fore.GREEN}✓ Temporary files cleaned up{Style.RESET_ALL}")
+                    
+                    # Sync Bedrock Knowledge Base after successful S3 upload
+                    kb_id = config.get("BEDROCK_KB_ID") or os.getenv("BEDROCK_KB_ID")
+                    datasource_id = config.get("BEDROCK_DATASOURCE_ID") or os.getenv("BEDROCK_DATASOURCE_ID")
+                    
+                    if kb_id and datasource_id:
+                        print(f"\n{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                        sync_success = sync_knowledge_base(kb_id, datasource_id)
+                        if sync_success:
+                            print(f"{Fore.GREEN}✓ Bedrock Knowledge Base sync initiated{Style.RESET_ALL}")
+                        else:
+                            print(f"{Fore.YELLOW}Bedrock Knowledge Base sync failed or was skipped{Style.RESET_ALL}")
+                        print(f"{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.YELLOW}Bedrock sync skipped: BEDROCK_KB_ID or BEDROCK_DATASOURCE_ID not configured in .env{Style.RESET_ALL}")
+                    
+                    print(f"\n{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                    print(f"{Fore.GREEN}✓✓✓ PIPELINE COMPLETE ✓✓✓{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
                 else:
                     print(f"\n{Fore.YELLOW}Files split successfully but S3 upload failed or was skipped.{Style.RESET_ALL}")
