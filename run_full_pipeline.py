@@ -34,7 +34,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1703,7 +1705,7 @@ def sanitize_filename_for_splitter(filename: str) -> str:
     return sanitized
 
 
-def split_posts_into_individual_files(flat_path: Path) -> Path | None:
+def split_posts_into_individual_files(flat_path: Path, use_temp_dir: bool = False) -> Path | None:
     """
     Split each post from flattened JSON into individual files with metadata convention.
     
@@ -1719,6 +1721,10 @@ def split_posts_into_individual_files(flat_path: Path) -> Path | None:
         },
         "content": "OCR text here..."  // Gets chunked and embedded
     }
+    
+    Args:
+        flat_path: Path to flattened JSON file
+        use_temp_dir: If True, use a temporary directory that will be cleaned up after upload
     
     Returns:
         Path to output directory if successful, None otherwise
@@ -1739,11 +1745,16 @@ def split_posts_into_individual_files(flat_path: Path) -> Path | None:
         print(f"{Fore.YELLOW}No posts to split!{Style.RESET_ALL}")
         return None
     
-    # Determine output directory (same directory as flattened file, in a subdirectory)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir_path = flat_path.parent / f"posts_{timestamp}"
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-    print(f"{Fore.CYAN}Output directory: {output_dir_path}{Style.RESET_ALL}\n")
+    # Determine output directory - use temp directory if requested, otherwise use timestamped directory
+    if use_temp_dir:
+        output_dir_path = Path(tempfile.mkdtemp(prefix="reddit_posts_", suffix="_temp"))
+        print(f"{Fore.CYAN}Using temporary directory: {output_dir_path}{Style.RESET_ALL}")
+    else:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir_path = flat_path.parent / f"posts_{timestamp}"
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+        print(f"{Fore.CYAN}Output directory: {output_dir_path}{Style.RESET_ALL}")
+    print()
     
     # Process each post
     saved_count = 0
@@ -1820,7 +1831,7 @@ def split_posts_into_individual_files(flat_path: Path) -> Path | None:
     return output_dir_path
 
 
-def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "") -> bool:
+def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "", cleanup_after: bool = False) -> bool:
     """
     Upload all files from a local directory to S3 bucket.
     
@@ -1828,6 +1839,7 @@ def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "") -> bool
         local_dir: Local directory containing files to upload
         bucket_name: S3 bucket name
         s3_prefix: S3 key prefix (optional, e.g., "posts/2024/")
+        cleanup_after: If True, delete the local directory after successful upload
     
     Returns:
         True if successful, False otherwise
@@ -1902,9 +1914,12 @@ def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "") -> bool
                 failed_count += 1
                 error_msg = str(e)
                 # Try to extract error code if it's a boto3 ClientError
-                if hasattr(e, 'response') and hasattr(e.response, 'get'):
-                    error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-                    error_msg = f"{error_code}: {error_msg}"
+                if ClientError and isinstance(e, ClientError):
+                    try:
+                        error_code = e.response.get('Error', {}).get('Code', 'Unknown')  # type: ignore
+                        error_msg = f"{error_code}: {error_msg}"
+                    except (AttributeError, KeyError):
+                        pass  # Fall back to original error message
                 print(f"{Fore.RED}[{i}/{total_files}] Failed to upload {filename}: {error_msg}{Style.RESET_ALL}")
                 if failed_count <= 3:
                     print(f"{Fore.YELLOW}  Full error: {str(e)}{Style.RESET_ALL}")
@@ -1917,6 +1932,15 @@ def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "") -> bool
         # Construct S3 URL
         s3_url = f"s3://{bucket_name}/{s3_prefix.rstrip('/') if s3_prefix else ''}"
         print(f"{Fore.CYAN}S3 Location: {s3_url}{Style.RESET_ALL}")
+        
+        # Clean up local directory if requested and upload was successful
+        if cleanup_after and uploaded_count > 0 and local_dir.exists():
+            try:
+                print(f"{Fore.CYAN}Cleaning up temporary directory: {local_dir}{Style.RESET_ALL}")
+                shutil.rmtree(local_dir)
+                print(f"{Fore.GREEN}✓ Temporary directory deleted{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.YELLOW}Warning: Failed to delete temporary directory {local_dir}: {e}{Style.RESET_ALL}")
         
         return uploaded_count > 0
         
@@ -1949,15 +1973,19 @@ def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None
     print(f"{Fore.CYAN}Cleaning pipeline results (removing duplicates, fixing order)...{Style.RESET_ALL}")
     cleaned_payload = build_clean_payload(raw_data)
     
-    # Save cleaned version
-    cleaned_path = OUTPUT_ROOT / "pipeline_results.cleaned.json"
-    tmp_path = cleaned_path.with_suffix(cleaned_path.suffix + ".tmp")
-    tmp_path.write_text(
-        json.dumps(cleaned_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    if not _atomic_replace(tmp_path, cleaned_path):
-        cleaned_path.write_text(tmp_path.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"{Fore.GREEN}Cleaned payload written to: {cleaned_path}{Style.RESET_ALL}")
+    # Only save cleaned version if we're processing all posts (not just new ones)
+    # When processing only new posts, we don't need to write this file
+    if not newly_processed_post_ids:
+        cleaned_path = OUTPUT_ROOT / "pipeline_results.cleaned.json"
+        tmp_path = cleaned_path.with_suffix(cleaned_path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(cleaned_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        if not _atomic_replace(tmp_path, cleaned_path):
+            cleaned_path.write_text(tmp_path.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"{Fore.GREEN}Cleaned payload written to: {cleaned_path}{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.CYAN}Skipping cleaned.json write (only processing new posts, using temp files){Style.RESET_ALL}")
     
     # Create flattened version
     print(f"{Fore.CYAN}Creating flattened dataset...{Style.RESET_ALL}")
@@ -1973,7 +2001,6 @@ def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None
             return
     
     # Create a temporary flat payload for the filtered posts (for splitting/uploading)
-    # Note: We still save the full flattened dataset, but only split/upload the new posts
     filtered_flat_payload = {
         "metadata": {
             "source": input_path.name,
@@ -1985,28 +2012,28 @@ def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None
         "posts": flat_entries,
     }
     
-    # Save the full flattened dataset (for reference)
-    flat_path = OUTPUT_ROOT / "pipeline_results.cleaned.flat.json"
-    full_flat_payload = {
-        "metadata": {
-            "source": input_path.name,
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "total_posts": len(build_flat_posts(cleaned_payload)),
-        },
-        "posts": build_flat_posts(cleaned_payload),
-    }
-    tmp_flat_path = flat_path.with_suffix(flat_path.suffix + ".tmp")
-    tmp_flat_path.write_text(
-        json.dumps(full_flat_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    if not _atomic_replace(tmp_flat_path, flat_path):
-        flat_path.write_text(tmp_flat_path.read_text(encoding="utf-8"), encoding="utf-8")
-    
-    if newly_processed_post_ids:
-        print(f"{Fore.GREEN}Full flattened dataset written to: {flat_path} ({len(full_flat_payload['posts'])} total entries){Style.RESET_ALL}")
-        print(f"{Fore.CYAN}Will split and upload only {len(flat_entries)} newly processed posts{Style.RESET_ALL}")
-    else:
+    # Only save the full flattened dataset if we're processing all posts (not just new ones)
+    # When processing only new posts, we use temp files and don't write to disk
+    if not newly_processed_post_ids:
+        flat_path = OUTPUT_ROOT / "pipeline_results.cleaned.flat.json"
+        full_flat_payload = {
+            "metadata": {
+                "source": input_path.name,
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total_posts": len(flat_entries),
+            },
+            "posts": flat_entries,
+        }
+        tmp_flat_path = flat_path.with_suffix(flat_path.suffix + ".tmp")
+        tmp_flat_path.write_text(
+            json.dumps(full_flat_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        if not _atomic_replace(tmp_flat_path, flat_path):
+            flat_path.write_text(tmp_flat_path.read_text(encoding="utf-8"), encoding="utf-8")
         print(f"{Fore.GREEN}Flattened dataset written to: {flat_path} ({len(flat_entries)} entries){Style.RESET_ALL}")
+    else:
+        print(f"{Fore.CYAN}Skipping flattened dataset write (only processing new posts, using temp files){Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Will split and upload only {len(flat_entries)} newly processed posts{Style.RESET_ALL}")
     
     # Print summary (only for newly processed posts if filtering)
     if newly_processed_post_ids:
@@ -2027,29 +2054,45 @@ def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None
     print(f"{Fore.CYAN}Splitting posts into individual files (FINAL OUTPUT)...{Style.RESET_ALL}")
     print(f"{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
     try:
+        # Use temp files when processing only new posts
+        use_temp = newly_processed_post_ids is not None
+        
         # If filtering by newly processed posts, create a temporary file with only those posts
-        split_input_path = flat_path
+        split_input_path: Path | None = None
         temp_filtered_path: Path | None = None
+        
         if newly_processed_post_ids and flat_entries:
-            # Create temporary filtered file for splitting
-            temp_filtered_path = OUTPUT_ROOT / "pipeline_results.filtered.temp.json"
-            tmp_filtered_path = temp_filtered_path.with_suffix(temp_filtered_path.suffix + ".tmp")
-            tmp_filtered_path.write_text(
+            # Create temporary filtered file for splitting (will be cleaned up after use)
+            temp_filtered_path = Path(tempfile.mktemp(suffix=".json", prefix="pipeline_filtered_"))
+            temp_filtered_path.write_text(
                 json.dumps(filtered_flat_payload, indent=2, ensure_ascii=False), encoding="utf-8"
             )
-            if not _atomic_replace(tmp_filtered_path, temp_filtered_path):
-                temp_filtered_path.write_text(tmp_filtered_path.read_text(encoding="utf-8"), encoding="utf-8")
             split_input_path = temp_filtered_path
-            print(f"{Fore.CYAN}Using filtered data with {len(flat_entries)} newly processed posts for splitting{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Using temporary filtered file with {len(flat_entries)} newly processed posts{Style.RESET_ALL}")
+        elif not newly_processed_post_ids:
+            # Use the saved flat file
+            flat_path = OUTPUT_ROOT / "pipeline_results.cleaned.flat.json"
+            if flat_path.exists():
+                split_input_path = flat_path
+            else:
+                print(f"{Fore.YELLOW}No flattened file found, skipping split!{Style.RESET_ALL}")
+                split_input_path = None
+        else:
+            print(f"{Fore.YELLOW}No posts to split!{Style.RESET_ALL}")
+            split_input_path = None
         
-        split_output_dir = split_posts_into_individual_files(split_input_path)
-        
-        # Clean up temporary filtered file if it was created
-        if temp_filtered_path and temp_filtered_path.exists():
-            try:
-                temp_filtered_path.unlink()
-            except Exception:
-                pass  # Ignore cleanup errors
+        if split_input_path:
+            split_output_dir = split_posts_into_individual_files(split_input_path, use_temp_dir=use_temp)
+            
+            # Clean up temporary filtered file if it was created
+            if temp_filtered_path and temp_filtered_path.exists():
+                try:
+                    temp_filtered_path.unlink()
+                    print(f"{Fore.CYAN}Cleaned up temporary filtered file{Style.RESET_ALL}")
+                except Exception as e:
+                    print(f"{Fore.YELLOW}Warning: Failed to delete temp file {temp_filtered_path}: {e}{Style.RESET_ALL}")
+        else:
+            split_output_dir = None
         if split_output_dir:
             print(f"\n{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
             print(f"{Fore.GREEN}✓✓✓ FILES SPLIT COMPLETE ✓✓✓{Style.RESET_ALL}")
@@ -2067,14 +2110,28 @@ def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None
                 print(f"\n{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
                 print(f"{Fore.CYAN}Uploading split files to S3 bucket...{Style.RESET_ALL}")
                 print(f"{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
-                upload_success = upload_to_s3(split_output_dir, s3_bucket, s3_prefix)
+                # Clean up temp directory after upload if we're processing only new posts
+                cleanup_after_upload = newly_processed_post_ids is not None
+                if cleanup_after_upload:
+                    print(f"{Fore.CYAN}Note: Using temporary directory - will be deleted after upload{Style.RESET_ALL}")
+                upload_success = upload_to_s3(split_output_dir, s3_bucket, s3_prefix, cleanup_after=cleanup_after_upload)
                 if upload_success:
                     print(f"\n{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}✓✓✓ PIPELINE COMPLETE ✓✓✓{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}✓ Files uploaded to S3 bucket: {s3_bucket}{Style.RESET_ALL}")
+                    if cleanup_after_upload:
+                        print(f"{Fore.GREEN}✓ Temporary files cleaned up{Style.RESET_ALL}")
                     print(f"{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
                 else:
                     print(f"\n{Fore.YELLOW}Files split successfully but S3 upload failed or was skipped.{Style.RESET_ALL}")
+                    # Still try to clean up temp directory even if upload failed
+                    if cleanup_after_upload and split_output_dir.exists():
+                        try:
+                            print(f"{Fore.CYAN}Cleaning up temporary directory after failed upload...{Style.RESET_ALL}")
+                            shutil.rmtree(split_output_dir)
+                            print(f"{Fore.GREEN}✓ Temporary directory cleaned up{Style.RESET_ALL}")
+                        except Exception as e:
+                            print(f"{Fore.YELLOW}Warning: Failed to clean up temp directory: {e}{Style.RESET_ALL}")
             else:
                 print(f"\n{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
                 print(f"{Fore.GREEN}✓✓✓ PIPELINE COMPLETE ✓✓✓{Style.RESET_ALL}")

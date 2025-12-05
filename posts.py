@@ -854,7 +854,7 @@ def buildPosts(raw_json: Any, awards: list[Awards]) -> list[Post]:
                 else ""
             ),
             "num_comments": post_detail.get("num_comments", 0),
-            "awards": random.sample(awards, random.randint(0, 3)),
+            "awards": random.sample(awards, min(random.randint(0, 3), len(awards))) if awards else [],
             "text": (
                 post_detail.get("selftext", "")
                 if post_detail.get("selftext", "")
