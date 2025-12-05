@@ -40,13 +40,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Sequence, TextIO, cast
 from requests.exceptions import HTTPError
-from collections import defaultdict
+from collections import defaultdict, Counter
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue
 
 from colorama import Fore, Style
 from dotenv import dotenv_values
+
+# Try to import boto3 for S3 upload support (optional)
+BOTO3_AVAILABLE = False
+boto3 = None
+ClientError = None
+BotoCoreError = None
+
+try:
+    import boto3  # type: ignore
+    from botocore.exceptions import ClientError, BotoCoreError  # type: ignore
+    BOTO3_AVAILABLE = True
+except ImportError:
+    pass
 
 # Force UTF-8 output on Windows terminals so we can dump the raw JSON safely.
 if sys.platform.startswith("win"):
@@ -1364,6 +1377,7 @@ def main():
     reader = init_ocr_reader()
     processed = 0
     skipped = 0
+    newly_processed_post_ids: set[str] = set()  # Track which posts were newly processed in this run
 
     workers = max(1, args.workers)
     ocr_workers = max(1, args.ocr_workers)
@@ -1479,6 +1493,10 @@ def main():
         # Process new posts from this batch immediately
         if new_posts_in_batch:
             print(f"{Fore.GREEN}Processing {len(new_posts_in_batch)} new posts from batch {batch_number}...{Style.RESET_ALL}")
+            # Track which post IDs are being processed in this batch
+            batch_post_ids = {str(post.get("id") or post.get("name") or "") for post in new_posts_in_batch}
+            newly_processed_post_ids.update(batch_post_ids)
+            
             process_batch_concurrently(
                 new_posts_in_batch, 
                 reader, 
@@ -1506,6 +1524,568 @@ def main():
     print(
         f"\n{Fore.CYAN}Pipeline update complete. Processed {processed} new posts, skipped {skipped} existing posts from {args.subreddit}.{Style.RESET_ALL}"
     )
+    
+    # Run cleaning/processing steps on the aggregated results
+    # Only process and upload newly processed posts
+    if AGGREGATE_OUTPUT_FILE.exists() and newly_processed_post_ids:
+        print(f"\n{Fore.CYAN}Starting data cleaning and flattening for {len(newly_processed_post_ids)} newly processed posts...{Style.RESET_ALL}")
+        try:
+            run_cleaning_steps(newly_processed_post_ids=newly_processed_post_ids)
+            print(f"{Fore.GREEN}Data cleaning complete!{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Data cleaning failed: {e}{Style.RESET_ALL}")
+            import traceback
+            traceback.print_exc()
+    elif not newly_processed_post_ids:
+        print(f"\n{Fore.CYAN}No new posts were processed, skipping cleaning and upload steps.{Style.RESET_ALL}")
+
+
+def normalize_path(path: str) -> str:
+    """Normalize file path for comparison."""
+    if not path:
+        return ""
+    return str(Path(path).as_posix()).lower()
+
+
+def text_from_extraction(extraction: Dict[str, Any]) -> str:
+    """Extract text from OCR extraction result in various formats."""
+    if not extraction:
+        return ""
+    value = extraction.get("text")
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        lines = [line.strip() for line in value if isinstance(line, str) and line.strip()]
+        if lines:
+            return "\n".join(lines)
+    lines = extraction.get("text_lines") or extraction.get("lines")
+    if isinstance(lines, list):
+        segments = []
+        for line in lines:
+            if isinstance(line, str):
+                trimmed = line.strip()
+                if trimmed:
+                    segments.append(trimmed)
+            elif isinstance(line, dict):
+                line_text = line.get("text")
+                if isinstance(line_text, str):
+                    trimmed = line_text.strip()
+                    if trimmed:
+                        segments.append(trimmed)
+        if segments:
+            return "\n".join(segments)
+    return ""
+
+
+def aggregate_post_text(post: Dict[str, Any]) -> str:
+    """Aggregate all OCR text from images in a post, maintaining order."""
+    local_images = [
+        item.get("local_path", "")
+        for item in post.get("images", {}).get("local_images", [])
+    ]
+    ocr_entries = post.get("ocr", {}).get("image_results", [])
+    path_index: defaultdict[str, List[Dict[str, Any]]] = defaultdict(list)
+    name_index: defaultdict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for entry in ocr_entries:
+        file_path = entry.get("file_path", "")
+        key = normalize_path(file_path)
+        if key:
+            path_index[key].append(entry)
+        name = Path(file_path).name.lower()
+        if name:
+            name_index[name].append(entry)
+
+    ordered_texts: List[str] = []
+
+    def extract_next_entry(path_key: str, name_key: str | None) -> Dict[str, Any] | None:
+        if path_key and path_index.get(path_key):
+            return path_index[path_key].pop(0)
+        if name_key and name_index.get(name_key):
+            return name_index[name_key].pop(0)
+        return None
+
+    for local_path in local_images:
+        key = normalize_path(local_path)
+        name = Path(local_path).name.lower()
+        entry = extract_next_entry(key, name)
+        if entry:
+            text = text_from_extraction(entry.get("extraction", {}))
+            if text:
+                ordered_texts.append(text)
+
+    # Append any remaining OCR entries that were not matched via local_images order
+    for entry_list in list(path_index.values()):
+        while entry_list:
+            entry = entry_list.pop(0)
+            text = text_from_extraction(entry.get("extraction", {}))
+            if text:
+                ordered_texts.append(text)
+    for entry_list in list(name_index.values()):
+        while entry_list:
+            entry = entry_list.pop(0)
+            text = text_from_extraction(entry.get("extraction", {}))
+            if text:
+                ordered_texts.append(text)
+
+    return "\n".join(ordered_texts)
+
+
+def rebuild_order(posts: Dict[str, Any], order: List[str]) -> List[str]:
+    """Rebuild order list, removing duplicates and adding missing posts."""
+    seen = set()
+    cleaned_order = []
+    for post_id in order:
+        if post_id in posts and post_id not in seen:
+            cleaned_order.append(post_id)
+            seen.add(post_id)
+    extras = sorted(pid for pid in posts if pid not in seen)
+    cleaned_order.extend(extras)
+    return cleaned_order
+
+
+def build_clean_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Clean pipeline results by removing duplicates and fixing order."""
+    posts = data.get("posts", {})
+    order = data.get("order", [])
+    cleaned_posts = {pid: posts[pid] for pid in posts if isinstance(pid, str)}
+    cleaned_order = rebuild_order(cleaned_posts, order)
+    metadata = dict(data.get("metadata", {}))
+    metadata["total_posts"] = len(cleaned_posts)
+    metadata["order_cleaned_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    chunk_ids = metadata.get("chunk_ids", [])
+    if isinstance(chunk_ids, list):
+        metadata["chunk_ids"] = sorted({_ for _ in chunk_ids if isinstance(_, int)})
+    else:
+        metadata["chunk_ids"] = []
+    return {"metadata": metadata, "posts": cleaned_posts, "order": cleaned_order}
+
+
+def build_flat_posts(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten pipeline results into a simpler structure with just essential fields."""
+    posts = data.get("posts", {})
+    ordered = data.get("order", [])
+    seen = set()
+    flat_list: List[Dict[str, Any]] = []
+
+    def append_entry(pid: str, post: Dict[str, Any]) -> None:
+        entry = {
+            "post_id": pid,
+            "title": post.get("title", ""),
+            "status": post.get("status", ""),
+            "correct_link": post.get("correct_link"),
+            "ocr_text": aggregate_post_text(post),
+        }
+        flat_list.append(entry)
+
+    for post_id in ordered:
+        post = posts.get(post_id)
+        if not post:
+            continue
+        seen.add(post_id)
+        append_entry(post_id, post)
+    for post_id, post in posts.items():
+        if post_id in seen:
+            continue
+        append_entry(post_id, post)
+    return flat_list
+
+
+def sanitize_filename_for_splitter(filename: str) -> str:
+    """Sanitize filename by removing/replacing invalid characters."""
+    # Remove or replace invalid characters for Windows filesystem
+    invalid_chars = r'[<>:"/\\|?*]'
+    sanitized = re.sub(invalid_chars, '_', filename)
+    # Remove leading/trailing spaces and dots
+    sanitized = sanitized.strip(' .')
+    # Limit length to avoid filesystem issues
+    if len(sanitized) > 200:
+        sanitized = sanitized[:200]
+    return sanitized
+
+
+def split_posts_into_individual_files(flat_path: Path) -> Path | None:
+    """
+    Split each post from flattened JSON into individual files with metadata convention.
+    
+    For each post, creates ONE file: {post_id},{title},{correct_link}.json
+    Contains nested metadata and content:
+    {
+        "metadata": {
+            "post_id": "...",
+            "title": "...",
+            "correct_link": "...",
+            "status": "...",
+            // ... all other metadata fields
+        },
+        "content": "OCR text here..."  // Gets chunked and embedded
+    }
+    
+    Returns:
+        Path to output directory if successful, None otherwise
+    """
+    if not flat_path.exists():
+        print(f"{Fore.YELLOW}No flattened file found at {flat_path}, skipping split.{Style.RESET_ALL}")
+        return None
+    
+    print(f"{Fore.CYAN}Loading flattened data from {flat_path}...{Style.RESET_ALL}")
+    with flat_path.open(encoding="utf-8") as fh:
+        data = json.load(fh)
+    
+    posts = data.get('posts', [])
+    total_posts = len(posts)
+    print(f"{Fore.CYAN}Total posts to split: {total_posts}{Style.RESET_ALL}")
+    
+    if total_posts == 0:
+        print(f"{Fore.YELLOW}No posts to split!{Style.RESET_ALL}")
+        return None
+    
+    # Determine output directory (same directory as flattened file, in a subdirectory)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir_path = flat_path.parent / f"posts_{timestamp}"
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    print(f"{Fore.CYAN}Output directory: {output_dir_path}{Style.RESET_ALL}\n")
+    
+    # Process each post
+    saved_count = 0
+    skipped_count = 0
+    
+    for i, post in enumerate(posts, 1):
+        post_id = post.get('post_id', f'post_{i}')
+        title = post.get('title', 'Untitled')
+        correct_link = post.get('correct_link') or ''  # Handle None values
+        ocr_text = post.get('ocr_text', '')
+        
+        # Sanitize title and correct_link for filesystem safety
+        title_str = str(title) if title else 'no_title'
+        sanitized_title = sanitize_filename_for_splitter(title_str) or 'no_title'
+        
+        # For correct_link, remove protocol and sanitize
+        sanitized_link = 'no_link'  # Default placeholder
+        if correct_link:
+            link_str = str(correct_link)
+            # Remove http:// or https://
+            link_str = link_str.replace('https://', '').replace('http://', '')
+            # Replace remaining problematic characters
+            sanitized_link = sanitize_filename_for_splitter(link_str) or 'no_link'
+        
+        # Build filename: post_id,title,correct_link.json
+        # Ensure all parts are strings (handle None/empty values)
+        filename_parts = [
+            str(post_id) if post_id else 'no_id',
+            str(sanitized_title) if sanitized_title else 'no_title',
+            str(sanitized_link) if sanitized_link else 'no_link'
+        ]
+        # Final safety check: ensure no None values remain (convert any None to string)
+        filename_parts = [str(part) if part is not None and part != '' else 'no_value' for part in filename_parts]
+        # Double-check: ensure all are actually strings before joining
+        filename_parts = [str(p) for p in filename_parts if p is not None]
+        filename = f"{','.join(filename_parts)}.json"
+        
+        output_file = output_dir_path / filename
+        
+        # Skip if file already exists (to avoid overwriting)
+        if output_file.exists():
+            if skipped_count < 3:
+                print(f"{Fore.YELLOW}[{i}/{total_posts}] Skipping {filename} (already exists){Style.RESET_ALL}")
+            skipped_count += 1
+            continue
+        
+        # Create single file with content (OCR text) and nested metadata
+        # Structure: metadata object + content field
+        metadata_fields = {k: v for k, v in post.items() if k != 'ocr_text'}
+        
+        file_data = {
+            "metadata": metadata_fields,  # All fields except ocr_text nested in metadata
+            "content": ocr_text  # Content field for chunking and embedding
+        }
+        
+        # Save post to file
+        try:
+            with output_file.open('w', encoding='utf-8') as f:
+                json.dump(file_data, f, indent=2, ensure_ascii=False)
+            
+            saved_count += 1
+            if saved_count % 50 == 0:
+                print(f"{Fore.CYAN}[{i}/{total_posts}] Saved {saved_count} posts...{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}[{i}/{total_posts}] Error saving {filename}: {e}{Style.RESET_ALL}")
+            skipped_count += 1
+    
+    print(f"\n{Fore.GREEN}Successfully saved {saved_count} posts to individual files{Style.RESET_ALL}")
+    if skipped_count > 0:
+        print(f"{Fore.YELLOW}Skipped {skipped_count} posts (already exist or errors){Style.RESET_ALL}")
+    print(f"{Fore.GREEN}Output directory: {output_dir_path}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Each post has 1 file: {{post_id}},{{title}},{{correct_link}}.json (contains content + metadata){Style.RESET_ALL}")
+    
+    return output_dir_path
+
+
+def upload_to_s3(local_dir: Path, bucket_name: str, s3_prefix: str = "") -> bool:
+    """
+    Upload all files from a local directory to S3 bucket.
+    
+    Args:
+        local_dir: Local directory containing files to upload
+        bucket_name: S3 bucket name
+        s3_prefix: S3 key prefix (optional, e.g., "posts/2024/")
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    if not BOTO3_AVAILABLE:
+        print(f"{Fore.YELLOW}S3 upload skipped: boto3 not available{Style.RESET_ALL}")
+        return False
+    
+    if not local_dir.exists() or not local_dir.is_dir():
+        print(f"{Fore.YELLOW}S3 upload skipped: directory {local_dir} does not exist{Style.RESET_ALL}")
+        return False
+    
+    # Load AWS credentials from environment
+    config = dotenv_values(".env")
+    aws_access_key_id = config.get("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = config.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    aws_region = config.get("AWS_REGION") or os.getenv("AWS_REGION", "us-east-1")
+    
+    if not aws_access_key_id or not aws_secret_access_key:
+        print(f"{Fore.YELLOW}S3 upload skipped: AWS credentials not found in environment{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env file{Style.RESET_ALL}")
+        return False
+    
+    try:
+        # Initialize S3 client (boto3 is guaranteed to be available here due to BOTO3_AVAILABLE check)
+        if boto3 is None:  # type: ignore
+            return False
+        
+        s3_client = boto3.client(  # type: ignore
+            's3',
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            region_name=aws_region
+        )
+        
+        # Get all JSON files from directory
+        json_files = list(local_dir.glob("*.json"))
+        total_files = len(json_files)
+        
+        if total_files == 0:
+            print(f"{Fore.YELLOW}No JSON files found in {local_dir} to upload{Style.RESET_ALL}")
+            return False
+        
+        print(f"\n{Fore.CYAN}Uploading {total_files} files to S3 bucket: {bucket_name}{Style.RESET_ALL}")
+        if s3_prefix:
+            print(f"{Fore.CYAN}S3 prefix: {s3_prefix}{Style.RESET_ALL}")
+        
+        uploaded_count = 0
+        failed_count = 0
+        
+        for i, file_path in enumerate(json_files, 1):
+            # Construct S3 key
+            filename = file_path.name
+            if s3_prefix:
+                s3_key = f"{s3_prefix.rstrip('/')}/{filename}"
+            else:
+                s3_key = filename
+            
+            try:
+                # Upload file to S3
+                s3_client.upload_file(
+                    str(file_path),
+                    bucket_name,
+                    s3_key,
+                    ExtraArgs={'ContentType': 'application/json'}
+                )
+                uploaded_count += 1
+                
+                if uploaded_count % 50 == 0:
+                    print(f"{Fore.CYAN}[{i}/{total_files}] Uploaded {uploaded_count} files...{Style.RESET_ALL}")
+            except Exception as e:
+                failed_count += 1
+                error_msg = str(e)
+                # Try to extract error code if it's a boto3 ClientError
+                if hasattr(e, 'response') and hasattr(e.response, 'get'):
+                    error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                    error_msg = f"{error_code}: {error_msg}"
+                print(f"{Fore.RED}[{i}/{total_files}] Failed to upload {filename}: {error_msg}{Style.RESET_ALL}")
+                if failed_count <= 3:
+                    print(f"{Fore.YELLOW}  Full error: {str(e)}{Style.RESET_ALL}")
+        
+        print(f"\n{Fore.GREEN}✓ S3 Upload Complete!{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}  Uploaded: {uploaded_count}/{total_files} files{Style.RESET_ALL}")
+        if failed_count > 0:
+            print(f"{Fore.YELLOW}  Failed: {failed_count} files{Style.RESET_ALL}")
+        
+        # Construct S3 URL
+        s3_url = f"s3://{bucket_name}/{s3_prefix.rstrip('/') if s3_prefix else ''}"
+        print(f"{Fore.CYAN}S3 Location: {s3_url}{Style.RESET_ALL}")
+        
+        return uploaded_count > 0
+        
+    except Exception as e:
+        print(f"{Fore.RED}Error during S3 upload: {str(e)}{Style.RESET_ALL}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def run_cleaning_steps(newly_processed_post_ids: set[str] | None = None) -> None:
+    """
+    Run cleaning and flattening steps on pipeline results.
+    
+    Args:
+        newly_processed_post_ids: Set of post IDs that were newly processed in this run.
+                                  If provided, only these posts will be split and uploaded.
+                                  If None, all posts will be processed (legacy behavior).
+    """
+    input_path = AGGREGATE_OUTPUT_FILE
+    if not input_path.exists():
+        print(f"{Fore.YELLOW}No pipeline results file found at {input_path}, skipping cleaning.{Style.RESET_ALL}")
+        return
+    
+    print(f"{Fore.CYAN}Loading pipeline results from {input_path}...{Style.RESET_ALL}")
+    with input_path.open(encoding="utf-8") as fh:
+        raw_data = json.load(fh)
+    
+    # Clean the data
+    print(f"{Fore.CYAN}Cleaning pipeline results (removing duplicates, fixing order)...{Style.RESET_ALL}")
+    cleaned_payload = build_clean_payload(raw_data)
+    
+    # Save cleaned version
+    cleaned_path = OUTPUT_ROOT / "pipeline_results.cleaned.json"
+    tmp_path = cleaned_path.with_suffix(cleaned_path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(cleaned_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    if not _atomic_replace(tmp_path, cleaned_path):
+        cleaned_path.write_text(tmp_path.read_text(encoding="utf-8"), encoding="utf-8")
+    print(f"{Fore.GREEN}Cleaned payload written to: {cleaned_path}{Style.RESET_ALL}")
+    
+    # Create flattened version
+    print(f"{Fore.CYAN}Creating flattened dataset...{Style.RESET_ALL}")
+    flat_entries = build_flat_posts(cleaned_payload)
+    
+    # Filter to only newly processed posts if specified
+    if newly_processed_post_ids:
+        original_count = len(flat_entries)
+        flat_entries = [post for post in flat_entries if post.get("post_id") in newly_processed_post_ids]
+        print(f"{Fore.CYAN}Filtered to {len(flat_entries)} newly processed posts (from {original_count} total){Style.RESET_ALL}")
+        if len(flat_entries) == 0:
+            print(f"{Fore.YELLOW}No newly processed posts found in flattened data, skipping split and upload.{Style.RESET_ALL}")
+            return
+    
+    # Create a temporary flat payload for the filtered posts (for splitting/uploading)
+    # Note: We still save the full flattened dataset, but only split/upload the new posts
+    filtered_flat_payload = {
+        "metadata": {
+            "source": input_path.name,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_posts": len(flat_entries),
+            "filtered": newly_processed_post_ids is not None,
+            "newly_processed_count": len(flat_entries) if newly_processed_post_ids else None,
+        },
+        "posts": flat_entries,
+    }
+    
+    # Save the full flattened dataset (for reference)
+    flat_path = OUTPUT_ROOT / "pipeline_results.cleaned.flat.json"
+    full_flat_payload = {
+        "metadata": {
+            "source": input_path.name,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_posts": len(build_flat_posts(cleaned_payload)),
+        },
+        "posts": build_flat_posts(cleaned_payload),
+    }
+    tmp_flat_path = flat_path.with_suffix(flat_path.suffix + ".tmp")
+    tmp_flat_path.write_text(
+        json.dumps(full_flat_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    if not _atomic_replace(tmp_flat_path, flat_path):
+        flat_path.write_text(tmp_flat_path.read_text(encoding="utf-8"), encoding="utf-8")
+    
+    if newly_processed_post_ids:
+        print(f"{Fore.GREEN}Full flattened dataset written to: {flat_path} ({len(full_flat_payload['posts'])} total entries){Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Will split and upload only {len(flat_entries)} newly processed posts{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.GREEN}Flattened dataset written to: {flat_path} ({len(flat_entries)} entries){Style.RESET_ALL}")
+    
+    # Print summary (only for newly processed posts if filtering)
+    if newly_processed_post_ids:
+        status_counts = Counter(post.get("status", "unknown") for post in flat_entries)
+        print(f"\n{Fore.CYAN}Cleaning Summary (Newly Processed Posts Only):{Style.RESET_ALL}")
+        print(f"  Total new posts: {len(flat_entries)}")
+    else:
+        status_counts = Counter(post.get("status", "unknown") for post in cleaned_payload["posts"].values())
+        print(f"\n{Fore.CYAN}Cleaning Summary:{Style.RESET_ALL}")
+        print(f"  Total posts: {len(cleaned_payload['posts'])}")
+    print(f"  Status breakdown:")
+    for status, count in status_counts.most_common():
+        print(f"    {status:15} {count}")
+    
+    # Split posts into individual files with metadata convention
+    # This is the final output - individual files with metadata as filename
+    print(f"\n{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Splitting posts into individual files (FINAL OUTPUT)...{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+    try:
+        # If filtering by newly processed posts, create a temporary file with only those posts
+        split_input_path = flat_path
+        temp_filtered_path: Path | None = None
+        if newly_processed_post_ids and flat_entries:
+            # Create temporary filtered file for splitting
+            temp_filtered_path = OUTPUT_ROOT / "pipeline_results.filtered.temp.json"
+            tmp_filtered_path = temp_filtered_path.with_suffix(temp_filtered_path.suffix + ".tmp")
+            tmp_filtered_path.write_text(
+                json.dumps(filtered_flat_payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            if not _atomic_replace(tmp_filtered_path, temp_filtered_path):
+                temp_filtered_path.write_text(tmp_filtered_path.read_text(encoding="utf-8"), encoding="utf-8")
+            split_input_path = temp_filtered_path
+            print(f"{Fore.CYAN}Using filtered data with {len(flat_entries)} newly processed posts for splitting{Style.RESET_ALL}")
+        
+        split_output_dir = split_posts_into_individual_files(split_input_path)
+        
+        # Clean up temporary filtered file if it was created
+        if temp_filtered_path and temp_filtered_path.exists():
+            try:
+                temp_filtered_path.unlink()
+            except Exception:
+                pass  # Ignore cleanup errors
+        if split_output_dir:
+            print(f"\n{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}✓✓✓ FILES SPLIT COMPLETE ✓✓✓{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}Individual post files in directory:{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}{split_output_dir}{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}Each file format: {{post_id}},{{title}},{{correct_link}}.json{Style.RESET_ALL}")
+            
+            # Upload split files to S3 bucket
+            config = dotenv_values(".env")
+            s3_bucket = config.get("S3_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME")
+            s3_prefix = config.get("S3_PREFIX", "") or os.getenv("S3_PREFIX", "")
+            
+            if s3_bucket:
+                print(f"\n{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Uploading split files to S3 bucket...{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                upload_success = upload_to_s3(split_output_dir, s3_bucket, s3_prefix)
+                if upload_success:
+                    print(f"\n{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                    print(f"{Fore.GREEN}✓✓✓ PIPELINE COMPLETE ✓✓✓{Style.RESET_ALL}")
+                    print(f"{Fore.GREEN}✓ Files uploaded to S3 bucket: {s3_bucket}{Style.RESET_ALL}")
+                    print(f"{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                else:
+                    print(f"\n{Fore.YELLOW}Files split successfully but S3 upload failed or was skipped.{Style.RESET_ALL}")
+            else:
+                print(f"\n{Fore.CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}✓✓✓ PIPELINE COMPLETE ✓✓✓{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}S3 upload skipped: S3_BUCKET_NAME not configured in .env{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}Post splitting was skipped.{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"{Fore.YELLOW}Warning: Post splitting failed: {e}{Style.RESET_ALL}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
